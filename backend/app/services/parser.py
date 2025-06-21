@@ -1,0 +1,597 @@
+"""
+Enhanced Generic Bank Statement Parser
+Handles multiple bank formats, various header structures, and flexible data extraction
+"""
+from typing import List, Dict, Optional, Union, Tuple, Any
+from datetime import datetime
+import io
+import re
+import logging
+
+import pandas as pd
+import pdfplumber
+from fastapi import HTTPException, status
+
+from app.schemas import StatementItem
+
+# Optional OCR fallback
+import pytesseract
+from pdf2image import convert_from_bytes
+
+import cProfile, pstats
+# Configure Tesseract
+DEFAULT_TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = pytesseract.pytesseract.tesseract_cmd or DEFAULT_TESSERACT_CMD
+
+logger = logging.getLogger(__name__)
+
+# Enhanced header aliases with priority-based mapping
+HEADER_ALIASES: Dict[str, Dict[str, int]] = {
+    "date": {
+        # Primary date fields (higher priority)
+        "tran date": 10, "transaction date": 10, "txn date": 10,
+        "date": 9, "posting date": 9, "entry date": 9,
+        # Secondary date fields
+        "value date": 5, "value dt": 5, "date (value date)": 5,
+        "date(value date)": 5, "date value": 5, "booking date": 5,
+        "settlement date": 4, "trade date": 4, "deal date": 4,
+        "post date": 4, "process date": 4, "accounting date": 4
+    },
+    "narration": {
+        "particulars": 10, "description": 10, "narration": 10,
+        "transaction details": 9, "details": 9, "transaction particulars": 8,
+        "narrative": 8, "payee": 7, "merchant/payee information": 7,
+        "remarks": 6, "memo": 6, "transaction description": 6,
+        "payee details": 5, "beneficiary": 5, "merchant name": 5
+    },
+    "instrument": {
+        "tr mode instrument": 10, "tr. mode instrument": 10,
+        "mode instrument": 9, "instrument": 9, "payment mode": 8,
+        "transfer mode": 8, "payment instrument": 7, "txn mode": 7,
+        "transaction method": 6, "transaction type": 6, "channel": 5
+    },
+    "ref_no": {
+        "ref/cheque no": 10,"ref/chequeno.": 10, "ref/cheque no.": 10, "ref no": 10,
+        "cheque no.": 9, "cheque number": 9, "chq no": 9,
+        "chq./ref no.": 9, "ref. no": 9, "reference no": 8,
+        "transaction id": 8, "utr no": 8, "utr/reference no": 7,
+        "voucher no": 6, "batch no": 5, "advice no": 5, "Refchequeno": 10, "Ref/Cheque No.": 10
+    },
+    "debit": {
+        "debit": 10, "debit amt.": 10, "debit amount": 10,
+        "withdrawal": 9, "withdrawn": 9, "dr": 9, "dr amt": 9,
+        "amount withdrawn": 8, "withdrawal amount": 8, "paid out": 7,
+        "payments out": 7, "money out": 7, "outflow": 6, "charge": 5
+    },
+    "credit": {
+        "credit": 10, "credit amt.": 10, "credit amount": 10,
+        "deposit": 9, "cr": 9, "cr amt": 9, "amount deposited": 8,
+        "paid in": 7, "payments in": 7, "money in": 7,
+        "inflow": 6, "receipt": 6, "collection": 5
+    },
+    "balance": {
+        "balance": 10, "running balance": 9, "available balance": 9,
+        "closing balance": 8, "new balance": 8, "current balance": 7,
+        "ledger balance": 6, "account balance": 6, "book balance": 5
+    }
+}
+
+def map_headers_with_priority(raw_headers: List[str]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    field_assignments: Dict[str, Tuple[str, int]] = {}
+
+    for raw_header in raw_headers:
+        if not raw_header or pd.isna(raw_header):
+            continue
+
+        norm = normalize_header_name(raw_header)
+        if not norm:
+            continue
+
+        best_field = None
+        best_priority = 0
+
+        for field, aliases in HEADER_ALIASES.items():
+            if norm in aliases:
+                priority = aliases[norm]
+                if priority > best_priority:
+                    best_field = field
+                    best_priority = priority
+
+        if best_field:
+            if best_field in field_assignments:
+                existing_header, existing_priority = field_assignments[best_field]
+                if best_priority > existing_priority:
+                    if mapping.get(existing_header) == best_field:
+                        del mapping[existing_header]
+                    mapping[raw_header] = best_field
+                    field_assignments[best_field] = (raw_header, best_priority)
+            else:
+                mapping[raw_header] = best_field
+                field_assignments[best_field] = (raw_header, best_priority)
+
+    logger.debug("🗺 Header mapping: %s", mapping)
+    return mapping
+
+def normalize_header_name(raw: str) -> str:
+    if not raw or pd.isna(raw):
+        return ""
+
+    h = str(raw).strip().lower()
+    # remove parentheses content
+    h = re.sub(r"\s*\([^)]*\)", "", h)
+    # remove punctuation except slash
+    h = re.sub(r"[^\w\s/\.]", " ", h)
+    h = re.sub(r"\s+", " ", h).strip()
+    return h
+
+def parse_date_string(date_input: Union[str, pd.Series, Any]) -> Optional[datetime]:
+    """Enhanced date parsing with better type handling."""
+    # Handle pandas Series or other non-string types
+    if isinstance(date_input, pd.Series):
+        if date_input.empty:
+            return None
+        date_str = str(date_input.iloc[0]) if len(date_input) > 0 else ""
+    else:
+        date_str = str(date_input) if date_input is not None else ""
+    
+    if not date_str or date_str.lower() in ['nan', 'none', '', 'nat']:
+        return None
+    
+    # Clean the date string
+    date_str = date_str.strip()
+    if not date_str:
+        return None
+    
+    # Remove any extra content after the date
+    date_parts = date_str.split()
+    if date_parts:
+        date_str = date_parts[0]
+    
+    # Comprehensive date formats
+    date_formats = [
+        "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y",
+        "%d-%b-%Y", "%d-%b-%y", "%d %b %Y", "%d %b %y",
+        "%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y",
+        "%d.%m.%Y", "%d.%m.%y", "%Y.%m.%d",
+        "%d %B %Y", "%d-%B-%Y", "%B %d, %Y"
+    ]
+    
+    for fmt in date_formats:
+        try:
+            parsed_date = datetime.strptime(date_str, fmt)
+            logger.debug("✅ Parsed date '%s' with format '%s'", date_str, fmt)
+            return parsed_date
+        except ValueError:
+            continue
+    
+    logger.debug("❌ Failed to parse date: '%s'", date_str)
+    return None
+
+def safe_numeric_conversion(value: Any) -> Optional[float]:
+    """Safely convert various types to numeric values."""
+    if value is None or pd.isna(value):
+        return None
+    
+    # Handle pandas Series
+    if isinstance(value, pd.Series):
+        if value.empty:
+            return None
+        value = value.iloc[0] if len(value) > 0 else None
+        if value is None or pd.isna(value):
+            return None
+    
+    # Convert to string and clean
+    str_val = str(value).strip()
+    if not str_val or str_val.lower() in ['nan', 'none', '', '0.0', '0']:
+        return None
+    
+    # Remove common formatting
+    str_val = str_val.replace(',', '').replace('₹', '').replace('$', '')
+    str_val = re.sub(r'[^\d.-]', '', str_val)
+    
+    if not str_val:
+        return None
+    
+    try:
+        return float(str_val)
+    except ValueError:
+        logger.debug("❌ Failed to convert to number: '%s'", str_val)
+        return None
+
+def extract_reference(narration: str) -> Optional[str]:
+    """
+    Extract reference numbers from narration using regex.
+    Handles spaced UPI patterns.
+    """
+    if not narration:
+        return None
+    patterns = [
+        r"UPI/DR/(\d{5}\s\d{6,7})",
+        r"UPI/DR/(\d{10,12})",
+        r"(?:IMPS|NEFT|RTGS)[/\-:]([A-Za-z0-9]{8,12})",
+        r"(?:UTR|REF|TXN)[/\-:]([A-Za-z0-9]{6,12})",
+        r"(?:CHQ|CHEQUE)[/\-:]?(\d{6,})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, narration, re.IGNORECASE)
+        if m:
+            ref = m.group(1).replace(" ", "")
+            logger.debug("✅ extract_reference matched %s → %s", pat, ref)
+            return ref
+    m = re.search(r"\b(\d{10,})\b", narration)
+    if m:
+        ref = m.group(1)
+        logger.debug("✅ extract_reference fallback → %s", ref)
+        return ref
+    return None
+
+
+def enhanced_reference_extraction(row_dict: Dict[str, Any], description: str) -> Optional[str]:
+    """
+    Return raw ref_no if non-empty; otherwise regex on combined fields.
+    """
+    raw_ref = row_dict.get('ref_no')
+    if raw_ref is not None and not (isinstance(raw_ref, float) and pd.isna(raw_ref)):
+        s = str(raw_ref).strip()
+        if s:
+            logger.debug("🔗 Raw ref_no from row: %s", s)
+            # Clean if it contains keywords like 'TRANSFER TO'
+            match = re.search(r"\b(?:TRANSFER\s+TO|TO)\s*(\d{6,})\s*(\d{5,})", s, re.IGNORECASE)
+            if match:
+                cleaned_ref = match.group(1) + match.group(2)
+                logger.debug("🔧 Cleaned ref_no from pattern: %s", cleaned_ref)
+                return cleaned_ref
+            # If just numeric and clean, return as is
+            if s.replace(" ", "").isdigit():
+                return s.replace(" ", "")
+            return s
+
+    parts = [str(v).strip() for v in row_dict.values() if v is not None and not (isinstance(v, float) and pd.isna(v))]
+    combined = " ".join(parts + [description])
+    logger.debug("🔍 enhanced_reference_extraction on: %s", combined)
+    # reuse extract_reference patterns
+    ref = extract_reference(combined)
+    if ref:
+        logger.debug("✅ enhanced_reference_extraction found → %s", ref)
+        return ref
+    return None
+
+
+def parse_flexible_rows(df: pd.DataFrame) -> List[StatementItem]:
+    """Parse DataFrame rows with enhanced flexibility and reference extraction."""
+    items: List[StatementItem] = []
+    if df.empty or df.shape[1] < 3:
+        logger.debug("⚠ DataFrame empty or too few cols")
+        return items
+    logger.debug("🔄 Parsing %d rows", len(df))
+    for idx, row in df.iterrows():
+        try:
+            row_dict = row.to_dict()
+            # Date
+            date = None
+            for c in df.columns:
+                if 'date' in c.lower():
+                    date = parse_date_string(row_dict.get(c))
+                    if date:
+                        break
+            if not date:
+                continue
+            # Amounts
+            debit = safe_numeric_conversion(row_dict.get('debit'))
+            credit = safe_numeric_conversion(row_dict.get('credit'))
+            balance = safe_numeric_conversion(row_dict.get('balance'))
+            amount = credit if credit else -abs(debit or 0)
+            # Description
+            desc_parts = []
+            for f in ['instrument','narration','description','particulars']:
+                v = row_dict.get(f)
+                if v and not pd.isna(v):
+                    desc_parts.append(" ".join(str(v).splitlines()).strip())
+            description = " - ".join(desc_parts) or "Transaction"
+            # Pass the full row dict to allow raw ref_no column to take precedence
+            reference = enhanced_reference_extraction(row_dict, description)
+
+            if not reference:
+                reference = extract_reference(row_dict.get('narration',''))
+            # Build item
+            item = StatementItem(
+                date=date,
+                description=description,
+                amount=amount,
+                balance=balance,
+                ref_no=reference,
+                debit=debit,
+                credit=credit
+            )
+            items.append(item)
+        except Exception as e:
+            logger.error("Error parsing row %d: %s", idx, e)
+    logger.debug("✅ Parsed %d items", len(items))
+    return items
+
+def clean_and_validate_row(row: List[Any], expected_cols: int) -> Optional[List[str]]:
+    """Enhanced row cleaning and validation."""
+    if not row:
+        return None
+    
+    # Convert all values to strings and clean
+    cleaned = []
+    for cell in row:
+        if cell is None or pd.isna(cell):
+            cleaned.append('')
+        else:
+            cell_str = str(cell).strip()
+            # Clean multi-line content
+            cell_str = " ".join(cell_str.splitlines())
+            cleaned.append(cell_str)
+    
+    # Skip completely empty rows
+    if not any(cleaned):
+        return None
+    
+    # Skip header-like rows that appear in data
+    row_text = ' '.join(cleaned).lower()
+    skip_patterns = [
+        r'^opening balance$',
+        r'^closing balance$',
+        r'statement.*period',
+        r'account.*number',
+        r'branch.*name'
+    ]
+    
+    for pattern in skip_patterns:
+        if re.search(pattern, row_text) and not any(word in row_text for word in ['neft', 'rtgs', 'upi', 'transfer']):
+            logger.debug("🚫 Skipping header-like row: %s", row_text[:50])
+            return None
+    
+    # Ensure minimum data quality
+    non_empty_count = sum(1 for cell in cleaned if cell)
+    if non_empty_count < 2:
+        return None
+    
+    # Pad or truncate to expected length
+    while len(cleaned) < expected_cols:
+        cleaned.append('')
+    
+    return cleaned[:expected_cols]
+
+def find_header_row_enhanced(table: List[List[Any]], min_confidence: float = 0.6) -> Optional[int]:
+    """Enhanced header detection with confidence scoring."""
+    if not table:
+        return None
+    
+    all_aliases = set()
+    for field_aliases in HEADER_ALIASES.values():
+        all_aliases.update(field_aliases.keys())
+    
+    best_row_idx = None
+    best_score = 0
+    
+    for idx, row in enumerate(table):
+        if not row or len(row) < 3:  # Need at least 3 columns
+            continue
+        
+        # Calculate confidence score
+        total_cols = len([cell for cell in row if cell and str(cell).strip()])
+        if total_cols == 0:
+            continue
+        
+        matches = 0
+        for cell in row:
+            if cell and not pd.isna(cell):
+                normalized = normalize_header_name(str(cell))
+                if normalized in all_aliases:
+                    matches += 1
+        
+        confidence = matches / total_cols
+        
+        if confidence >= min_confidence and confidence > best_score:
+            best_score = confidence
+            best_row_idx = idx
+            
+        logger.debug("📊 Row %d: %d matches out of %d columns (confidence: %.2f)", 
+                    idx, matches, total_cols, confidence)
+    
+    if best_row_idx is not None:
+        logger.debug("🎯 Best header row: %d (confidence: %.2f)", best_row_idx, best_score)
+    
+    return best_row_idx
+
+def extract_tables_enhanced(file_bytes: bytes) -> List[Dict]:
+    """Enhanced table extraction with better error handling."""
+    transactions: List[Dict] = []
+    last_header: List[str] = []
+    last_mapping: Dict[str, str] = {}
+    
+    # Patterns to filter out footer/header noise
+    NOISE_PATTERNS = [
+        re.compile(r"State Bank of India|printstatement|Page \d+", re.IGNORECASE),
+        re.compile(r"^\s*$"),  # Empty lines
+        re.compile(r"^-+$"),   # Separator lines
+    ]
+    
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            logger.debug("📄 Processing PDF with %d pages", len(pdf.pages))
+            
+            for page_num, page in enumerate(pdf.pages, 1):
+                logger.debug("📄 Processing page %d", page_num)
+                
+                # Extract and clean text
+                raw_text = page.extract_text() or ""
+                clean_lines = []
+                for line in raw_text.splitlines():
+                    if not any(pattern.search(line) for pattern in NOISE_PATTERNS):
+                        clean_lines.append(line)
+                
+                # Override page text with cleaned version
+                if hasattr(page, '_text'):
+                    page._text = "\n".join(clean_lines)
+                
+                # Extract tables
+                try:
+                    tables = page.extract_tables() or []
+                    logger.debug("📋 Found %d tables on page %d", len(tables), page_num)
+                    
+                    for table_idx, table in enumerate(tables, 1):
+                        if not table or len(table) < 1:
+                            continue
+                        
+                        logger.debug("🔍 Processing table %d (page %d) with %d rows", 
+                                   table_idx, page_num, len(table))
+                        
+                        # Try to find header
+                        header_idx = find_header_row_enhanced(table)
+                        current_header = []
+                        current_mapping = {}
+                        data_start_idx = 0
+                        
+                        if header_idx is not None:
+                            # Found header in this table
+                            current_header = [str(cell) if cell else '' for cell in table[header_idx]]
+                            current_mapping = map_headers_with_priority(current_header)
+                            logger.debug("🔎 RAW header row: %r", current_header)
+                            logger.debug("🔨  MAPPED as:    %r", current_mapping)
+                            last_header = current_header
+                            last_mapping = current_mapping
+                            data_start_idx = header_idx + 1
+                            logger.debug("✅ Found header at row %d: %s", header_idx, current_header)
+                            
+                        elif last_header:
+                            # Use cached header from previous table/page
+                            current_header = last_header
+                            current_mapping = last_mapping
+                            data_start_idx = 0
+                            logger.debug("🔁 Using cached header: %s", current_header)
+                            
+                        else:
+                            logger.debug("⚠ No header found for table %d on page %d", table_idx, page_num)
+                            continue
+                        
+                        if not current_mapping:
+                            logger.debug("⚠ No field mapping for table %d on page %d", table_idx, page_num)
+                            continue
+                        
+                        # Extract and clean data rows
+                        data_rows = []
+                        for row_idx in range(data_start_idx, len(table)):
+                            cleaned_row = clean_and_validate_row(table[row_idx], len(current_header))
+                            if cleaned_row:
+                                data_rows.append(cleaned_row)
+                        
+                        if not data_rows:
+                            logger.debug("⚠ No valid data rows in table %d on page %d", table_idx, page_num)
+                            continue
+                        
+                        # Create DataFrame and parse
+                        try:
+                            df = pd.DataFrame(data_rows, columns=current_header)
+                            df = df.rename(columns=current_mapping)
+                            
+                            logger.debug("📊 Created DataFrame with columns: %s", list(df.columns))
+                            
+                            parsed_items = parse_flexible_rows(df)
+                            for item in parsed_items:
+                                transactions.append(vars(item))
+                            
+                            logger.debug("✅ Parsed %d transactions from table %d on page %d", 
+                                       len(parsed_items), table_idx, page_num)
+                            
+                        except Exception as e:
+                            logger.error("❌ Error creating DataFrame for table %d on page %d: %s", 
+                                       table_idx, page_num, str(e))
+                            continue
+                            
+                except Exception as e:
+                    logger.error("❌ Error extracting tables from page %d: %s", page_num, str(e))
+                    continue
+    
+    except Exception as e:
+        logger.error("❌ Critical error in table extraction: %s", str(e))
+        return []
+    
+    logger.debug("✅ Total transactions extracted: %d", len(transactions))
+    return transactions
+
+# Update main parsing functions
+def parse_file(file_bytes: bytes, filename: str) -> List[StatementItem]:
+    """Enhanced main parsing function."""
+    ext = filename.lower().rsplit('.', 1)[-1]
+    
+    if ext == 'pdf':
+        records = extract_tables_enhanced(file_bytes)
+        if not records:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, 
+                              "No transactions could be parsed from the PDF. Please ensure the file contains a valid bank statement.")
+    elif ext == 'csv':
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes))
+            mapping = map_headers_with_priority(list(df.columns))
+            df = df.rename(columns=mapping)
+            records = [vars(item) for item in parse_flexible_rows(df)]
+        except Exception as e:
+            logger.error("❌ Error parsing CSV: %s", str(e))
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Error parsing CSV file: {str(e)}")
+    else:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unsupported file type: .{ext}")
+    
+    return [StatementItem(**record) for record in records]
+
+# Service class remains the same but uses enhanced functions
+class ParserService:
+    """Enhanced service wrapper."""
+    
+    @staticmethod
+    def extract_text_bytes(b: bytes) -> str:
+        try:
+            with pdfplumber.open(io.BytesIO(b)) as pdf:
+                text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            if not text.strip():
+                logger.debug("📃 No text layer; using OCR")
+                imgs = convert_from_bytes(b)
+                text = '\n'.join(pytesseract.image_to_string(img) for img in imgs)
+            return text
+        except Exception as e:
+            logger.error("❌ Error extracting text: %s", str(e))
+            return ''
+    
+    @staticmethod
+    def extract_text(b: bytes) -> str:
+        return ParserService.extract_text_bytes(b)
+    
+    @staticmethod
+    def parse_file_bytes(b: bytes, f: str) -> List[StatementItem]:
+        return parse_file(b, f)
+    
+    @staticmethod
+    def parse_file(b: bytes, f: str) -> List[StatementItem]:
+        return parse_file(b, f)
+    
+    # ─── PROFILING GUARD ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import cProfile
+    import pstats
+
+    # 1) Path to one of your test PDFs (adjust as needed)
+    SAMPLE = "tests/fixtures/sample_statement.pdf"
+
+    # 2) Read its bytes
+    try:
+        with open(SAMPLE, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        print(f"❌ Could not find sample file at {SAMPLE}")
+        exit(1)
+
+    # 3) Wrap the call you want to profile
+    def timed_parse():
+        # parse_file is the function you wrote above
+        parse_file(data, SAMPLE)
+
+    # 4) Run the profiler, writing to stats.out
+    cProfile.run("timed_parse()", "stats.out")
+
+    # 5) Load and print the top 20 cumulative-time entries
+    stats = pstats.Stats("stats.out")
+    stats.strip_dirs().sort_stats("cumtime").print_stats(20)

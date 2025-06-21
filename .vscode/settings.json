@@ -1,0 +1,7 @@
+{
+  // Tells Pylance where to look for installed packages
+  "python.analysis.extraPaths": [
+    "backend/.venv/Lib/site-packages"
+  ]
+  
+}
