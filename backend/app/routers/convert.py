@@ -2,7 +2,9 @@
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, status
 from sqlalchemy.orm import Session
-from typing import List, Literal
+from typing import List
+import io
+import pdfplumber
 
 from app.core.deps import get_db, get_current_user
 from app.schemas import StatementItem, ConversionResponse, TransactionOut
@@ -27,6 +29,7 @@ async def convert_file_and_persist(
     """
     Accept an uploaded PDF or CSV bank statement, parse it, persist to DB,
     and return the new file_id for history/retrieval.
+    Deduct credits (1 per PDF page) only after successful conversion.
     """
     original_name = file.filename
     ext = original_name.lower().split('.')[-1]
@@ -37,6 +40,27 @@ async def convert_file_and_persist(
         )
 
     raw_bytes = await file.read()
+    page_count = 0
+
+    # Pre-flight: count pages and ensure credits for PDFs
+    if ext == "pdf":
+        try:
+            with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                page_count = len(pdf.pages)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Unable to read PDF file for page count.",
+            )
+        # Use the correct attribute for credits
+        if current_user.credits_remaining < page_count:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=(f"Not enough credits: you need {page_count} "
+                        f"but have {current_user.credits_remaining}."),
+            )
+
+    # 1. Parse file
     try:
         items: List[StatementItem] = ParserService.parse_file(raw_bytes, original_name)
     except ValueError as e:
@@ -45,34 +69,22 @@ async def convert_file_and_persist(
             detail=str(e),
         )
 
+    # 2. Persist statement
     db_statement = crud.create_statement(
         db=db,
         user_id=current_user.id,
         original_filename=original_name,
         fmt=ext,
     )
-
     tx_dicts = [item.dict() for item in items]
     crud.create_transactions(db, statement_id=db_statement.id, transactions=tx_dicts)
+
+    # 3. Mark processed and deduct credits post-success
+    # Ensure we track processed flag and timestamp
+    db_statement.processed = True
     crud.mark_statement_processed(db, db_statement)
 
+    if ext == "pdf" and page_count > 0:
+        crud.decrement_credits(db, current_user.id, page_count)
+
     return ConversionResponse(download_url=f"{db_statement.file_id}")
-
-@router.get(
-    "/history/{file_id}",
-    response_model=List[TransactionOut],
-    status_code=status.HTTP_200_OK,
-)
-def get_converted_history(
-    file_id: str,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """
-    Retrieve all transactions for a given file_id (statement) and return them as JSON.
-    """
-    stmt = crud.get_statement_by_file_id(db, file_id)
-    if not stmt or stmt.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Statement not found.")
-
-    return [TransactionOut.from_orm(tx) for tx in stmt.transactions]

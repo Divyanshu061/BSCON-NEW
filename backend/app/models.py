@@ -1,5 +1,3 @@
-# backend/app/models.py
-
 from datetime import datetime
 from enum import Enum as PyEnum
 from sqlalchemy import (
@@ -13,11 +11,12 @@ from sqlalchemy import (
     Boolean,
     Enum,
     func,
+    text
 )
 from sqlalchemy.orm import relationship
+
 from app.utils.database import Base
 from app.core.config import BillingCycle as BillingCycleEnum
-
 
 class User(Base):
     __tablename__ = "users"
@@ -32,8 +31,13 @@ class User(Base):
         server_default=func.now(),
         nullable=False
     )
-    # Credits for PDF pages (1 credit = 1 page)
-    credits_remaining = Column(Integer, default=5, nullable=False)
+    credits_remaining = Column(
+        Integer,
+        default=5,
+        server_default=text("5"),
+        nullable=False,
+        comment="Credits for PDF pages (1 credit = 1 page)"
+    )
 
     statements = relationship(
         "Statement",
@@ -81,6 +85,11 @@ class Statement(Base):
         nullable=False
     )
     processed = Column(Boolean, default=False, nullable=False)
+    processed_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp when this statement was marked processed"
+    )
 
     owner = relationship("User", back_populates="statements")
     transactions = relationship(
@@ -175,7 +184,12 @@ class ConversionHistory(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    timestamp = Column(DateTime(timezone=True), default=datetime.utcnow, server_default=func.now(), nullable=False)
+    timestamp = Column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+        server_default=func.now(),
+        nullable=False
+    )
     description = Column(String, nullable=False)
     pages_converted = Column(Integer, nullable=False)
     credits_spent = Column(Integer, nullable=False)
