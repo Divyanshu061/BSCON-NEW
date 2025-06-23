@@ -104,7 +104,6 @@ class Statement(Base):
             f"format={self.format!r} processed={self.processed}>"
         )
 
-
 class Transaction(Base):
     __tablename__ = "transactions"
 
@@ -119,6 +118,7 @@ class Transaction(Base):
     amount = Column(Float, nullable=False)
     balance = Column(Float, nullable=True)
     description = Column(Text, nullable=False, index=True)
+    ref_no = Column(String, nullable=True)
 
     statement = relationship("Statement", back_populates="transactions")
 

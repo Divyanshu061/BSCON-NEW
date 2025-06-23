@@ -85,7 +85,9 @@ def create_transactions(
             amount=tx['amount'],
             balance=tx.get('balance'),
             description=tx['description'],
+            ref_no=tx.get('ref_no')  # ✅ Include ref_no if available
         )
+
         objs.append(obj)
     db.bulk_save_objects(objs)
     db.commit()
@@ -116,4 +118,38 @@ def increment_credits(db: Session, user_id: int, amount: int) -> None:
 def mark_statement_processed(db: Session, statement: models.Statement) -> None:
     statement.processed_at = datetime.utcnow()
     db.commit()
-    db.refresh(statement)
+    db.refresh(statement) 
+
+def create_conversion_history(
+    db: Session,
+    user_id: int,
+    description: str,
+    pages_converted: int,
+    credits_spent: int
+) -> models.ConversionHistory:
+    rec = models.ConversionHistory(
+        user_id=user_id,
+        description=description,
+        pages_converted=pages_converted,
+        credits_spent=credits_spent,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+def get_conversion_history_for_user(
+    db: Session,
+    user_id: int,
+    skip: int = 0,
+    limit: int = 50
+) -> List[models.ConversionHistory]:
+    return (
+        db.query(models.ConversionHistory)
+          .filter(models.ConversionHistory.user_id == user_id)
+          .order_by(models.ConversionHistory.timestamp.desc())
+          .offset(skip)
+          .limit(limit)
+          .all()
+    )
+                      

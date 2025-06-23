@@ -114,3 +114,14 @@ class StatementDetail(StatementOut):
     transactions: List[Transaction] = []
 
     model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+class ConversionHistoryOut(BaseModel):
+    id: int
+    user_id: int
+    timestamp: datetime
+    description: str
+    pages_converted: int
+    credits_spent: int
+
+    class Config:
+        orm_mode = True

@@ -1,8 +1,11 @@
+#file app/routers/history.py
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db, get_current_user
 from app import crud, schemas
+from app.schemas import ConversionHistoryOut
 
 router = APIRouter(
     tags=["history"]
@@ -40,3 +43,15 @@ def get_statement_detail(
         raise HTTPException(status_code=404, detail="Statement not found.")
 
     return stmt
+
+@router.get("/conversions", response_model=list[ConversionHistoryOut])
+def get_conversion_history(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    List conversion-history entries (id, user_id, timestamp, description, pages_converted, credits_spent)
+    """
+    return crud.get_conversion_history_for_user(db, user.id, skip=skip, limit=limit)
